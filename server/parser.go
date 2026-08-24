@@ -54,6 +54,9 @@ type pubArg struct {
 	delivered bool // Only used for service imports
 }
 
+// Internal parser opcode for the negotiated Ls+/Ls- route protocol.
+const routeLeafNoOriginOp = byte(0x80)
+
 // Parser constants
 const (
 	OP_START parserState = iota
@@ -691,12 +694,17 @@ func (c *client) parse(buf []byte) error {
 						if trace {
 							c.traceInOp("RS+", arg)
 						}
-						err = c.processRemoteSub(arg, false)
+						err = c.processRemoteSub(arg, false, false)
 					case 'L', 'l':
 						if trace {
 							c.traceInOp("LS+", arg)
 						}
-						err = c.processRemoteSub(arg, true)
+						err = c.processRemoteSub(arg, true, true)
+					case routeLeafNoOriginOp:
+						if trace {
+							c.traceInOp("Ls+", arg)
+						}
+						err = c.processRemoteSub(arg, true, false)
 					}
 				case GATEWAY:
 					if trace {
@@ -720,8 +728,13 @@ func (c *client) parse(buf []byte) error {
 			}
 		case OP_L:
 			switch b {
-			case 'S', 's':
+			case 'S':
 				c.state = OP_LS
+			case 's':
+				c.state = OP_LS
+				if c.kind == ROUTER && c.op == 'L' {
+					c.op = routeLeafNoOriginOp
+				}
 			case 'M', 'm':
 				c.state = OP_M
 			default:
@@ -827,10 +840,12 @@ func (c *client) parse(buf []byte) error {
 							c.traceInOp("RS-", arg)
 						case 'L', 'l':
 							c.traceInOp("LS-", arg)
+						case routeLeafNoOriginOp:
+							c.traceInOp("Ls-", arg)
 						}
 					}
-					leafUnsub := c.op == 'L' || c.op == 'l'
-					err = c.processRemoteUnsub(arg, leafUnsub)
+					leafUnsub := c.op == 'L' || c.op == 'l' || c.op == routeLeafNoOriginOp
+					err = c.processRemoteUnsub(arg, leafUnsub, c.op == routeLeafNoOriginOp)
 				case GATEWAY:
 					if trace {
 						c.traceInOp("RS-", arg)

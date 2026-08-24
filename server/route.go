@@ -45,12 +45,14 @@ const (
 
 // Include the space for the proto
 var (
-	aSubBytes   = []byte{'A', '+', ' '}
-	aUnsubBytes = []byte{'A', '-', ' '}
-	rSubBytes   = []byte{'R', 'S', '+', ' '}
-	rUnsubBytes = []byte{'R', 'S', '-', ' '}
-	lSubBytes   = []byte{'L', 'S', '+', ' '}
-	lUnsubBytes = []byte{'L', 'S', '-', ' '}
+	aSubBytes    = []byte{'A', '+', ' '}
+	aUnsubBytes  = []byte{'A', '-', ' '}
+	rSubBytes    = []byte{'R', 'S', '+', ' '}
+	rUnsubBytes  = []byte{'R', 'S', '-', ' '}
+	lSubBytes    = []byte{'L', 'S', '+', ' '}
+	lUnsubBytes  = []byte{'L', 'S', '-', ' '}
+	lnSubBytes   = []byte{'L', 's', '+', ' '}
+	lnUnsubBytes = []byte{'L', 's', '-', ' '}
 )
 
 type route struct {
@@ -60,6 +62,7 @@ type route struct {
 	retry        bool
 	lnoc         bool
 	lnocu        bool
+	ln           bool
 	routeType    RouteType
 	url          *url.URL
 	authRequired bool
@@ -120,6 +123,7 @@ type connectInfo struct {
 	Dynamic  bool   `json:"cluster_dynamic,omitempty"`
 	LNOC     bool   `json:"lnoc,omitempty"`
 	LNOCU    bool   `json:"lnocu,omitempty"` // Support for LS- with origin cluster name
+	LN       bool   `json:"ln,omitempty"`    // Support for Ls+/Ls- leaf interest without an origin cluster
 	Gateway  string `json:"gateway,omitempty"`
 }
 
@@ -516,6 +520,7 @@ func (c *client) sendRouteConnect(clusterName string, tlsRequired bool) error {
 		Cluster:  clusterName,
 		Dynamic:  s.isClusterNameDynamic(),
 		LNOC:     true,
+		LN:       true,
 	}
 
 	b, err := json.Marshal(cinfo)
@@ -811,8 +816,9 @@ func (c *client) processRouteInfo(info *Info) {
 	c.route.tlsRequired = info.TLSRequired
 	c.route.gatewayURL = info.GatewayURL
 	c.route.remoteName = info.Name
-	c.route.lnoc = info.LNOC
-	c.route.lnocu = info.LNOCU
+	c.route.ln = info.LN
+	c.route.lnoc = info.LNOC || c.route.ln
+	c.route.lnocu = info.LNOCU || c.route.ln
 	c.route.jetstream = info.JetStream
 
 	// When sent through route INFO, if the field is set, it should be of size 1.
@@ -1266,10 +1272,11 @@ type asubs struct {
 // This is invoked knowing that the key contains an account name, so for a sub
 // that is not from a pinned-account route.
 // The `keyHasSubType` boolean indicates that the key starts with the indicator
-// for leaf or regular routed subscriptions.
+// for leaf or regular routed subscriptions. Ls+ subscriptions always have the
+// indicator so they remain distinct from RS+ even without LNOCU.
 func getAccNameFromRoutedSubKey(sub *subscription, key string, keyHasSubType bool) string {
 	var accIdx int
-	if keyHasSubType {
+	if keyHasSubType || (sub.leaf && len(sub.origin) == 0) {
 		// Start after the sub type indicator.
 		accIdx = 1
 		// But if there is an origin, bump its index.
@@ -1398,7 +1405,7 @@ func (c *client) parseUnsubProto(arg []byte, accInProto, hasOrigin bool) ([]byte
 }
 
 // Indicates no more interest in the given account/subject for the remote side.
-func (c *client) processRemoteUnsub(arg []byte, leafUnsub bool) (err error) {
+func (c *client) processRemoteUnsub(arg []byte, leafUnsub, noOrigin bool) (err error) {
 	srv := c.srv
 	if srv == nil {
 		return nil
@@ -1410,12 +1417,16 @@ func (c *client) processRemoteUnsub(arg []byte, leafUnsub bool) (err error) {
 
 	c.mu.Lock()
 	originSupport := c.route.lnocu
+	lnSupport := c.route.ln
 	if c.route != nil && len(c.route.accName) > 0 {
 		accountName, accInProto = string(c.route.accName), false
 	}
 	c.mu.Unlock()
+	if noOrigin && !lnSupport {
+		return fmt.Errorf("processRemoteUnsub Ls- not supported")
+	}
 
-	hasOrigin := leafUnsub && originSupport
+	hasOrigin := leafUnsub && !noOrigin && originSupport
 	_, accNameFromProto, subject, _, err := c.parseUnsubProto(arg, accInProto, hasOrigin)
 	if err != nil {
 		return fmt.Errorf("processRemoteUnsub %s", err.Error())
@@ -1442,7 +1453,7 @@ func (c *client) processRemoteUnsub(arg []byte, leafUnsub bool) (err error) {
 	_key := _keya[:0]
 
 	var key string
-	if !originSupport {
+	if !originSupport && !noOrigin {
 		// If it is an LS- or RS-, we use the protocol as-is as the key.
 		key = bytesToString(arg)
 	} else {
@@ -1483,7 +1494,7 @@ func (c *client) processRemoteUnsub(arg []byte, leafUnsub bool) (err error) {
 	return nil
 }
 
-func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
+func (c *client) processRemoteSub(argo []byte, leafSub, hasOrigin bool) (err error) {
 	// Indicate activity.
 	c.in.subs++
 
@@ -1512,8 +1523,12 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 	// the sub in the map.
 	c.mu.Lock()
 	accountName := string(c.route.accName)
-	oldStyle := !c.route.lnocu
+	lnSupport := c.route.ln
+	oldStyle := !c.route.lnocu && !(leafSub && !hasOrigin)
 	c.mu.Unlock()
+	if leafSub && !hasOrigin && !lnSupport {
+		return fmt.Errorf("processRemoteSub Ls+ not supported")
+	}
 
 	// Indicate if the account name should be in the protocol. It would be the
 	// case if accountName is empty.
@@ -1522,7 +1537,7 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 	// Copy so we do not reference a potentially large buffer.
 	// Add 2 more bytes for the routed sub type.
 	arg := make([]byte, 0, 2+len(argo))
-	if hasOrigin {
+	if leafSub {
 		arg = append(arg, keyRoutedLeafSubByte)
 	} else {
 		arg = append(arg, keyRoutedSubByte)
@@ -1552,7 +1567,7 @@ func (c *client) processRemoteSub(argo []byte, hasOrigin bool) (err error) {
 	}
 
 	delta := int32(1)
-	sub := &subscription{client: c}
+	sub := &subscription{client: c, leaf: leafSub}
 
 	// There will always be at least a subject, but its location will depend
 	// on if there is an origin, an account name, etc.. Since we know that
@@ -1738,6 +1753,12 @@ func (c *client) addRouteSubOrUnsubProtoToBuf(buf []byte, accName string, sub *s
 				buf = append(buf, ' ')
 			}
 		}
+	} else if sub.leaf && len(sub.origin) == 0 && c.route.ln {
+		if isSubProto {
+			buf = append(buf, lnSubBytes...)
+		} else {
+			buf = append(buf, lnUnsubBytes...)
+		}
 	} else {
 		if isSubProto {
 			buf = append(buf, rSubBytes...)
@@ -1843,13 +1864,15 @@ func (s *Server) sendSubsToRoute(route *client, idx int, account string) {
 			// Subject will always be the second field (index 1).
 			subj := stringToBytes(s[1])
 			// Check if the key is for a leaf (will be field 0).
-			forLeaf := s[0] == keyRoutedLeafSub
-			// For queue, if not for a leaf, we need 3 fields "R foo bar",
-			// but if for a leaf, we need 4 fields "L foo bar leaf_origin".
-			if l := len(s); (!forLeaf && l == 3) || (forLeaf && l == 4) {
+			leafWithOrigin := s[0] == keyRoutedLeafSub
+			leafWithoutOrigin := s[0] == keyRoutedLeafNoOriginSub
+			forLeaf := leafWithOrigin || leafWithoutOrigin
+			// For queue, regular and no-origin leaf keys have 3 fields,
+			// while a leaf key with an origin has 4.
+			if l := len(s); (!leafWithOrigin && l == 3) || (leafWithOrigin && l == 4) {
 				qn = stringToBytes(s[2])
 			}
-			if forLeaf {
+			if leafWithOrigin {
 				// The leaf origin will be the last field.
 				origin = stringToBytes(s[len(s)-1])
 			}
@@ -1858,7 +1881,7 @@ func (s *Server) sendSubsToRoute(route *client, idx int, account string) {
 			if !route.canImport(s[1]) {
 				continue
 			}
-			sub := subscription{origin: origin, subject: subj, queue: qn, qw: n}
+			sub := subscription{leaf: forLeaf, origin: origin, subject: subj, queue: qn, qw: n}
 			buf = route.addRouteSubOrUnsubProtoToBuf(buf, a.Name, &sub, true)
 		}
 		a.mu.RUnlock()
@@ -2746,6 +2769,7 @@ func (s *Server) startRouteAcceptLoop() {
 		Dynamic:      s.isClusterNameDynamic(),
 		LNOC:         true,
 		LNOCU:        true,
+		LN:           true,
 	}
 	// For tests that want to simulate old servers, do not set the compression
 	// on the INFO protocol if configured with CompressionNotSupported.
@@ -3078,8 +3102,9 @@ func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error
 	// Grab connection name of remote route.
 	c.mu.Lock()
 	c.route.remoteID = c.opts.Name
-	c.route.lnoc = proto.LNOC
-	c.route.lnocu = proto.LNOCU
+	c.route.ln = proto.LN // ... also implies LNOC+LNOCU
+	c.route.lnoc = proto.LNOC || c.route.ln
+	c.route.lnocu = proto.LNOCU || c.route.ln
 	c.setRoutePermissions(perms)
 	c.headers = supportsHeaders && proto.Headers
 	c.mu.Unlock()
