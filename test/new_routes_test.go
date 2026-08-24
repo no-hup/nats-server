@@ -1717,8 +1717,9 @@ func TestNewRouteLeafNodeOriginSupport(t *testing.T) {
 	info.Name = ""
 	info.LNOC = true
 	// Overwrite to false to check that we are getting LS- without origin
-	// if we are an old server.
+	// if we are an old server. LN implies LNOCU, so clear it too.
 	info.LNOCU = false
+	info.LN = false
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
