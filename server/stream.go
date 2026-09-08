@@ -4927,11 +4927,17 @@ func (mset *stream) processInboundSourceMsg(si *sourceInfo, m *inMsg) bool {
 // The source's ident must be passed in, as it can be mutated under the stream lock, which is not held here.
 // Format: <stream> <seq> <filter> <transform> <orig> [<ident>]
 func (si *sourceInfo) genSourceHeader(orig, reply, ident string) string {
-	var b strings.Builder
-	iNameParts := strings.Split(si.iname, " ")
+	// iname is "<stream> <filter> <transform>". Tokenize in place rather than
+	// splitting, this runs for every sourced message.
+	var ina [3]string
+	istart, iNameParts := 0, ina[:0]
+	for i := 0; i < len(si.iname); i++ {
+		if si.iname[i] == ' ' {
+			iNameParts, istart = append(iNameParts, si.iname[istart:i]), i+1
+		}
+	}
+	iNameParts = append(iNameParts, si.iname[istart:])
 
-	b.WriteString(iNameParts[0])
-	b.WriteByte(' ')
 	// Grab sequence as text here from reply subject.
 	var tsa [expectedNumReplyTokensV2]string
 	start, tokens := 0, tsa[:0]
@@ -4949,6 +4955,18 @@ func (si *sourceInfo) genSourceHeader(orig, reply, ident string) string {
 			seq = tokens[7]
 		}
 	}
+
+	var b strings.Builder
+	// iname already carries two of the four separators, so we only add the two
+	// around seq, plus one more when there is an ident.
+	n := len(si.iname) + len(seq) + len(orig) + 2
+	if ident != _EMPTY_ {
+		n += len(ident) + 1
+	}
+	b.Grow(n)
+
+	b.WriteString(iNameParts[0])
+	b.WriteByte(' ')
 	b.WriteString(seq)
 
 	b.WriteByte(' ')
@@ -5003,6 +5021,11 @@ func consumerFromAckReply(reply string) string {
 	return tokens[offset]
 }
 
+// Sizes the stack buffer used to tokenize a source header, which holds at most
+// <stream> <seq> <filter> <transform> <orig> [<ident>]. Longer headers still
+// parse, they just spill to the heap. This is not a length check.
+const maxSourceHdrTokens = 6
+
 // Extract the stream name, the source index name and the message sequence number from the source header.
 // Uses the filter and transform arguments to provide backwards compatibility
 // Format: <stream> <seq> <filter> <transform> <orig> [<ident>]
@@ -5012,7 +5035,14 @@ func streamAndSeq(shdr string) (string, string, uint64, string) {
 		return streamName, iname, seq, _EMPTY_
 	}
 	// New version which is stream index name <SPC> sequence
-	fields := strings.Split(shdr, " ")
+	var fsa [maxSourceHdrTokens]string
+	start, fields := 0, fsa[:0]
+	for i := 0; i < len(shdr); i++ {
+		if shdr[i] == ' ' {
+			fields, start = append(fields, shdr[start:i]), i+1
+		}
+	}
+	fields = append(fields, shdr[start:])
 	nFields := len(fields)
 
 	if nFields != 2 && nFields <= 3 {
@@ -5021,7 +5051,16 @@ func streamAndSeq(shdr string) (string, string, uint64, string) {
 
 	streamName := fields[0]
 	if nFields >= 4 {
-		iname := strings.Join([]string{fields[0], fields[2], fields[3]}, " ")
+		// This is the source index name, and it is used as a map key on the
+		// message store path, so build it in one allocation.
+		var b strings.Builder
+		b.Grow(len(fields[0]) + len(fields[2]) + len(fields[3]) + 2)
+		b.WriteString(fields[0])
+		b.WriteByte(' ')
+		b.WriteString(fields[2])
+		b.WriteByte(' ')
+		b.WriteString(fields[3])
+		iname := b.String()
 		seq := uint64(parseAckReplyNum(fields[1]))
 		var identity string
 		if nFields >= 6 {

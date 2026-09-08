@@ -2467,3 +2467,38 @@ func BenchmarkJetStreamDirectGet(b *testing.B) {
 		}
 	})
 }
+
+// Both of these run for every message a stream sources from another stream:
+// genSourceHeader when the sourcing consumer delivers it, streamAndSeq in the
+// store's "Track sources" block, which only fires when the message carries a
+// Nats-Stream-Source header. A direct publish onto the same stream skips both.
+func BenchmarkJetStreamSourceHeader(b *testing.B) {
+	si := &sourceInfo{iname: "ORDERS orders.> events.>"}
+	reply := "$JS.ACK.ORDERS.cons.1.123456.123456.1700000000000000000.0"
+
+	b.Run("Gen", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if h := si.genSourceHeader("orders.us.new", reply, "S1PLZQ8W7X"); h == _EMPTY_ {
+				b.Fatal("empty header")
+			}
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		hdr  string
+	}{
+		{"Parse", "ORDERS 123456 orders.> events.> orders.us.new"},
+		{"ParseWithIdent", "ORDERS 123456 orders.> events.> orders.us.new S1PLZQ8W7X"},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, iname, seq, _ := streamAndSeq(test.hdr); iname == _EMPTY_ || seq == 0 {
+					b.Fatal("bad parse")
+				}
+			}
+		})
+	}
+}

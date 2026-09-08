@@ -27033,3 +27033,66 @@ func TestJetStreamDynamicMaxStoreStableAcrossRestart(t *testing.T) {
 			friendlyBytes(int64(written)), friendlyBytes(before), friendlyBytes(after))
 	}
 }
+
+func TestJetStreamStreamAndSeqParsing(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		hdr    string
+		stream string
+		iname  string
+		seq    uint64
+		ident  string
+	}{
+		{"empty", _EMPTY_, _EMPTY_, _EMPTY_, 0, _EMPTY_},
+		{"stream only", "ORDERS", _EMPTY_, _EMPTY_, 0, _EMPTY_},
+		{"no index name", "ORDERS 5", "ORDERS", _EMPTY_, 5, _EMPTY_},
+		{"three fields", "ORDERS 5 orders.>", _EMPTY_, _EMPTY_, 0, _EMPTY_},
+		{"filter and transform", "ORDERS 5 orders.> events.>", "ORDERS", "ORDERS orders.> events.>", 5, _EMPTY_},
+		{"with orig", "ORDERS 5 orders.> events.> orders.us.new", "ORDERS", "ORDERS orders.> events.>", 5, _EMPTY_},
+		{"with ident", "ORDERS 123456 orders.> events.> orders.us.new S1PLZQ8W7X", "ORDERS", "ORDERS orders.> events.>", 123456, "S1PLZQ8W7X"},
+		{"empty filter and transform", "ORDERS 5  ", "ORDERS", "ORDERS  ", 5, _EMPTY_},
+		// The tokenizer sizes its stack buffer for the documented six fields.
+		// Anything longer must still parse, it just spills to the heap.
+		{"one field past the buffer", "ORDERS 123456 orders.> events.> orders.us.new S1PLZQ8W7X extra", "ORDERS", "ORDERS orders.> events.>", 123456, "S1PLZQ8W7X"},
+		{"well past the buffer", "ORDERS 5 orders.> events.> orders.us.new S1PLZQ8W7X 7 8 9 10 11 12", "ORDERS", "ORDERS orders.> events.>", 5, "S1PLZQ8W7X"},
+		{"old ack reply form", "$JS.ACK.ORDERS.cons.1.9.9.1700000000000000000.0", "ORDERS", _EMPTY_, 9, _EMPTY_},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stream, iname, seq, ident := streamAndSeq(test.hdr)
+			if stream != test.stream {
+				t.Fatalf("Expected stream %q, got %q", test.stream, stream)
+			}
+			if iname != test.iname {
+				t.Fatalf("Expected index name %q, got %q", test.iname, iname)
+			}
+			if seq != test.seq {
+				t.Fatalf("Expected seq %d, got %d", test.seq, seq)
+			}
+			if ident != test.ident {
+				t.Fatalf("Expected ident %q, got %q", test.ident, ident)
+			}
+		})
+	}
+}
+
+func TestJetStreamSourceHeaderRoundTrip(t *testing.T) {
+	si := &sourceInfo{iname: "ORDERS orders.> events.>"}
+	reply := "$JS.ACK.ORDERS.cons.1.123456.123456.1700000000000000000.0"
+
+	for _, ident := range []string{_EMPTY_, "S1PLZQ8W7X"} {
+		hdr := si.genSourceHeader("orders.us.new", reply, ident)
+		stream, iname, seq, gotIdent := streamAndSeq(hdr)
+		if stream != "ORDERS" {
+			t.Fatalf("Expected stream ORDERS, got %q (hdr %q)", stream, hdr)
+		}
+		if iname != si.iname {
+			t.Fatalf("Expected index name %q, got %q (hdr %q)", si.iname, iname, hdr)
+		}
+		if seq != 123456 {
+			t.Fatalf("Expected seq 123456, got %d (hdr %q)", seq, hdr)
+		}
+		if gotIdent != ident {
+			t.Fatalf("Expected ident %q, got %q (hdr %q)", ident, gotIdent, hdr)
+		}
+	}
+}
