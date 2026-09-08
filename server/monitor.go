@@ -3173,16 +3173,17 @@ func (s *Server) accountDetail(jsa *jsAccount, optStreams, optConsumers, optDire
 		for _, stream := range streams {
 			rgroup := stream.raftGroup()
 			ci := js.clusterInfo(rgroup)
+			// Skip if we are only looking for stream leaders. Do this before
+			// building the config below, which we would otherwise discard.
+			if optStreamLeader && ci != nil && ci.Leader != s.Name() {
+				continue
+			}
 			var cfg *StreamConfig
 			if optCfg {
 				// Report the config as requested, the stream can still be running at its origin.
 				// Must be consistent with the desired state reported as part of the cluster info.
 				c := js.targetStreamConfig(stream, stream.config())
 				cfg = &c
-			}
-			// Skip if we are only looking for stream leaders.
-			if optStreamLeader && ci != nil && ci.Leader != s.Name() {
-				continue
 			}
 			sdet := StreamDetail{
 				Name:    stream.name(),
